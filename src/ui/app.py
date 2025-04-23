@@ -21,34 +21,103 @@ class NumericalApp:
         self.logger = logging.getLogger(__name__)
         self.version = "1.0.0"  # Add version attribute
         
-        # Create the main window
-        self.root = ctk.CTk()
-        self.root.title("Numerical Analysis App")
-        self.root.geometry("1000x700")
+        # Flag to indicate if the application is shutting down - set first
+        self.is_shutting_down = False
         
         # Initialize attributes to track after events
         self.after_ids = {}
         
-        # Flag to indicate if the application is shutting down
-        self.is_shutting_down = False
+        # Create the main window
+        self.root = ctk.CTk()
+        self.root.title("Numerical Analysis App")
+        self.root.geometry("1000x700")
         
         # Add threading lock to prevent race conditions
         self.calculation_lock = threading.Lock()
         self.calculation_thread = None
         
         try:
+            # Set up window close handler immediately
+            def on_early_close():
+                self.is_shutting_down = True
+                if hasattr(self, 'root') and self.root.winfo_exists():
+                    self.root.quit()
+                    self.root.destroy()
+            
+            # Register early close handler
+            self.root.protocol("WM_DELETE_WINDOW", on_early_close)
+            
+            # Initialize core components
             self.theme_manager = ThemeManager()
             self.history_manager = HistoryManager()
             self.solver = Solver()
             self.theme = self.theme_manager.apply_theme()
+            
+            # Configure visual styles
             self.configure_table_style()
             
-            # Check DPI scaling once at initialization directly instead of using after
+            # Check DPI scaling once at initialization
             self.check_dpi_scaling()
-            self.setup_welcome_screen()
+            
+            # Show welcome screen only if not shutting down
+            if not self.is_shutting_down:
+                self.setup_welcome_screen()
+                
+                # Register the proper close handler once initialization is complete
+                self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+                
         except Exception as e:
             self.logger.error(f"Error initializing app: {str(e)}")
+            self.is_shutting_down = True
             raise
+    
+    def on_close(self):
+        """Handle window close event."""
+        try:
+            # Set the shutdown flag immediately
+            self.is_shutting_down = True
+            
+            # Process any pending events first to avoid them running during shutdown
+            if hasattr(self, 'root') and self.root.winfo_exists():
+                try:
+                    # Update to process any pending events
+                    self.root.update()
+                    
+                    # Run cleanup to cancel scheduled tasks
+                    self.cleanup()
+                    
+                    # Sleep briefly to allow any pending callbacks to be cancelled
+                    time.sleep(0.2)
+                    
+                    # Force cancel ALL after callbacks one more time
+                    try:
+                        for widget_id in self.root.tk.call('after', 'info'):
+                            try:
+                                self.root.after_cancel(int(widget_id))
+                            except:
+                                pass
+                    except:
+                        pass
+                    
+                    # Perform one more update to process any pending events
+                    self.root.update()
+                    
+                    # Destroy the window and exit mainloop
+                    self.root.quit()
+                    self.root.destroy()
+                except Exception as e:
+                    self.logger.error(f"Error during normal window close: {e}")
+                    # Force destroy as a last resort
+                    try:
+                        if hasattr(self, 'root') and self.root.winfo_exists():
+                            self.root.destroy()
+                    except:
+                        pass
+        except Exception as e:
+            self.logger.error(f"Error during window close: {e}")
+            # Force exit in case of failure
+            import sys
+            sys.exit(0)
 
     def configure_table_style(self):
         """Configure the table style for better visibility."""
@@ -85,6 +154,10 @@ class NumericalApp:
     def setup_welcome_screen(self):
         """Initialize and display the welcome screen."""
         try:
+            # Don't set up welcome screen if app is shutting down
+            if getattr(self, 'is_shutting_down', False):
+                return
+                
             self.welcome_frame = ctk.CTkFrame(self.root, fg_color=self.theme["bg"])
             self.welcome_frame.pack(fill="both", expand=True)
             
@@ -119,8 +192,14 @@ class NumericalApp:
             )
             loading_label.pack()
             
-            # Schedule transition to main window and track the after ID using safe_after
-            self.safe_after(2000, self.show_main_window, "welcome_transition")
+            # Define show_main window as a local function to avoid scheduling issues
+            def delayed_show_main():
+                # Check again just before showing the main window
+                if not getattr(self, 'is_shutting_down', False) and hasattr(self, 'root') and self.root.winfo_exists():
+                    self.show_main_window()
+            
+            # Schedule transition to main window using safe_after
+            self.safe_after(2000, delayed_show_main, "welcome_transition")
             
         except Exception as e:
             self.logger.error(f"Error setting up welcome screen: {str(e)}")
@@ -186,15 +265,15 @@ class NumericalApp:
     def update_ui_theme(self):
         """Update UI elements with the current theme."""
         try:
-            # If app is shutting down, don't proceed with updates
+            # Skip theme updates completely if shutting down
             if getattr(self, 'is_shutting_down', False):
                 return
                 
-            # Check if the window still exists before proceeding
+            # If window doesn't exist, don't try to update UI
             if not hasattr(self, 'root') or not self.root.winfo_exists():
                 return
                 
-            # Cancel any existing update_ui_theme callbacks
+            # Cancel any existing update_ui_theme callbacks to prevent duplicates
             if "update_ui_theme" in self.after_ids:
                 try:
                     self.root.after_cancel(self.after_ids["update_ui_theme"])
@@ -205,8 +284,8 @@ class NumericalApp:
             # Update the main window background
             self.root.configure(fg_color=self.theme.get("bg", "#F0F4F8"))
             
-            # Update the sidebar
-            if hasattr(self, "sidebar"):
+            # Update the sidebar if it exists
+            if hasattr(self, "sidebar") and self.sidebar is not None:
                 try:
                     self.sidebar.update_theme(self.theme)
                 except Exception as sidebar_error:
@@ -236,7 +315,9 @@ class NumericalApp:
             self.configure_table_style()
                 
         except Exception as e:
-            self.logger.error(f"Error updating UI theme: {str(e)}")
+            # Only log error if not shutting down
+            if not getattr(self, 'is_shutting_down', False):
+                self.logger.error(f"Error updating UI theme: {str(e)}")
 
     def show_home(self):
         """Display the home screen with input form and results table."""
@@ -2360,8 +2441,12 @@ class NumericalApp:
     def check_dpi_scaling(self):
         """Check and adjust for high DPI displays."""
         try:
-            # If app is shutting down, don't schedule any new tasks
+            # Skip DPI scaling check completely if shutting down
             if getattr(self, 'is_shutting_down', False):
+                return
+                
+            # If window doesn't exist, don't try to schedule anything
+            if not hasattr(self, 'root') or not self.root.winfo_exists():
                 return
                 
             # Cancel any existing check_dpi_scaling callbacks
@@ -2372,10 +2457,6 @@ class NumericalApp:
                 except Exception as e:
                     self.logger.debug(f"Error canceling check_dpi_scaling callback: {e}")
             
-            # Check if the window still exists before proceeding
-            if not hasattr(self, 'root') or not self.root.winfo_exists():
-                return
-                
             # Get screen width and height
             screen_width = self.root.winfo_screenwidth()
             screen_height = self.root.winfo_screenheight()
@@ -2390,37 +2471,51 @@ class NumericalApp:
                 self.logger.info(f"Adjusted scaling for Full HD+ display: {screen_width}x{screen_height}")
                 
         except Exception as e:
-            self.logger.warning(f"Failed to adjust DPI scaling: {e}")
-            
+            # Only log warning if not shutting down
+            if not getattr(self, 'is_shutting_down', False):
+                self.logger.warning(f"Failed to adjust DPI scaling: {e}")
+
     def cleanup(self):
         """Clean up resources and cancel scheduled events before closing."""
         try:
-            # Flag to indicate the application is shutting down
+            # Set the shutdown flag first to prevent new callbacks
             self.is_shutting_down = True
+            self.logger.info("Starting application cleanup...")
             
-            # Cancel all scheduled after events
+            # Stop any pending UI updates
+            if hasattr(self, 'root') and self.root.winfo_exists():
+                # Process any pending events before cancelling them
+                self.root.update()
+            
+            # Cancel all scheduled after events by name
             for after_id_name, after_id in list(self.after_ids.items()):
                 try:
-                    self.root.after_cancel(after_id)
-                    self.logger.debug(f"Cancelled after event: {after_id_name}")
+                    if hasattr(self, 'root') and self.root.winfo_exists():
+                        self.root.after_cancel(after_id)
+                        self.logger.debug(f"Cancelled after event: {after_id_name}")
                 except Exception as e:
                     self.logger.debug(f"Error cancelling after event {after_id_name}: {e}")
             
             # Clear after IDs dictionary
             self.after_ids.clear()
             
-            # Cancel all other after events
+            # Cancel all other after events that might not be tracked in after_ids
             try:
-                for widget_id in self.root.tk.call('after', 'info'):
-                    try:
-                        # Ensure widget_id is a valid integer before trying to cancel
-                        id_to_cancel = int(widget_id)
-                        if id_to_cancel > 0:
-                            self.root.after_cancel(id_to_cancel)
-                    except (ValueError, TypeError) as e:
-                        self.logger.debug(f"Invalid after ID {widget_id}: {e}")
-                    except Exception:
-                        pass
+                if hasattr(self, 'root') and self.root.winfo_exists():
+                    # Get all pending after callbacks
+                    all_after_ids = self.root.tk.call('after', 'info')
+                    
+                    for widget_id in all_after_ids:
+                        try:
+                            # Ensure widget_id is a valid integer before trying to cancel
+                            id_to_cancel = int(widget_id)
+                            if id_to_cancel > 0:
+                                self.root.after_cancel(id_to_cancel)
+                                self.logger.debug(f"Cancelled unnamed after event: {id_to_cancel}")
+                        except (ValueError, TypeError) as e:
+                            self.logger.debug(f"Invalid after ID {widget_id}: {e}")
+                        except Exception as e:
+                            self.logger.debug(f"Error cancelling after ID {widget_id}: {e}")
             except Exception as e:
                 self.logger.debug(f"Error during after events cleanup: {e}")
             
@@ -2431,7 +2526,7 @@ class NumericalApp:
             
             # Wait a brief moment to ensure all cancellations take effect
             time.sleep(0.1)
-                
+            
             self.logger.info("Application cleanup completed successfully")
         except Exception as e:
             self.logger.error(f"Error during application cleanup: {e}")
@@ -2442,27 +2537,11 @@ class NumericalApp:
             # Set shutdown flag to False during application startup
             self.is_shutting_down = False
             
-            # Register cleanup function to handle window close
-            # Use a safer shutdown sequence
-            def on_close():
-                try:
-                    self.cleanup()
-                    self.root.quit()  # Signal to exit mainloop
-                    self.root.destroy()  # Destroy the window
-                except Exception as e:
-                    self.logger.error(f"Error during window close: {e}")
-                    # Try one more time to destroy the window
-                    try:
-                        self.root.destroy()
-                    except:
-                        pass
-            
-            self.root.protocol("WM_DELETE_WINDOW", on_close)
-            
             # Start the main event loop
             self.root.mainloop()
         except Exception as e:
             # Attempt cleanup
+            self.is_shutting_down = True
             self.cleanup()
             self.logger.error(f"Error running application: {str(e)}")
             raise
@@ -2478,7 +2557,7 @@ class NumericalApp:
         Returns:
             The after ID if scheduled, or None if app is shutting down
         """
-        # Check for shutdown flag
+        # Check for shutdown flag - don't schedule new callbacks during shutdown
         if getattr(self, 'is_shutting_down', False):
             return None
             
@@ -2488,17 +2567,27 @@ class NumericalApp:
             
         # Create a wrapper to check if app is still running before executing callback
         def safe_callback_wrapper():
+            # We need to check again if app is shutting down or destroyed
             if not getattr(self, 'is_shutting_down', False) and hasattr(self, 'root') and self.root.winfo_exists():
                 try:
                     callback()
                 except Exception as e:
                     self.logger.error(f"Error in delayed callback: {str(e)}")
+            else:
+                self.logger.debug(f"Skipped callback execution - application shutting down or destroyed")
         
         # Schedule the callback
         after_id = self.root.after(delay, safe_callback_wrapper)
         
         # Track the ID if name provided
         if after_id_name:
+            # Remove any existing after ID with the same name
+            if after_id_name in self.after_ids:
+                try:
+                    self.root.after_cancel(self.after_ids[after_id_name])
+                except Exception:
+                    pass
+            # Store the new after ID
             self.after_ids[after_id_name] = after_id
             
         return after_id
