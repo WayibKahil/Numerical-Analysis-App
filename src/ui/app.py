@@ -29,6 +29,9 @@ class NumericalApp:
         # Initialize attributes to track after events
         self.after_ids = {}
         
+        # Flag to indicate if the application is shutting down
+        self.is_shutting_down = False
+        
         # Add threading lock to prevent race conditions
         self.calculation_lock = threading.Lock()
         self.calculation_thread = None
@@ -116,9 +119,8 @@ class NumericalApp:
             )
             loading_label.pack()
             
-            # Schedule transition to main window and track the after ID
-            after_id = self.root.after(2000, self.show_main_window)
-            self.after_ids["welcome_transition"] = after_id
+            # Schedule transition to main window and track the after ID using safe_after
+            self.safe_after(2000, self.show_main_window, "welcome_transition")
             
         except Exception as e:
             self.logger.error(f"Error setting up welcome screen: {str(e)}")
@@ -184,6 +186,14 @@ class NumericalApp:
     def update_ui_theme(self):
         """Update UI elements with the current theme."""
         try:
+            # If app is shutting down, don't proceed with updates
+            if getattr(self, 'is_shutting_down', False):
+                return
+                
+            # Check if the window still exists before proceeding
+            if not hasattr(self, 'root') or not self.root.winfo_exists():
+                return
+                
             # Cancel any existing update_ui_theme callbacks
             if "update_ui_theme" in self.after_ids:
                 try:
@@ -444,6 +454,10 @@ class NumericalApp:
         Args:
             **kwargs: Keyword arguments containing method parameters
         """
+        # Check if application is shutting down
+        if getattr(self, 'is_shutting_down', False):
+            return
+        
         # Clear previous results
         if hasattr(self, 'result_label'):
             self.result_label.configure(text="")
@@ -519,6 +533,10 @@ class NumericalApp:
         # Store parameters for thread
         self.solve_params = kwargs.copy()
         
+        # Set calculation active flag
+        with self.calculation_lock:
+            self.calculation_active = True
+            
         # Extract parameters from kwargs for info display
         f_str = kwargs.get('f_str', '')
         method = kwargs.get('method', '')
@@ -538,7 +556,11 @@ class NumericalApp:
         # Define function to run in thread
         def calculation_thread():
             try:
+                # Check if calculation is still active
                 with self.calculation_lock:
+                    if not self.calculation_active or self.is_shutting_down:
+                        return
+                
                     # Extract parameters from kwargs
                     f_str = self.solve_params.get('f_str', '')
                     method = self.solve_params.get('method', '')
@@ -548,16 +570,36 @@ class NumericalApp:
                     max_iter = self.solve_params.get('max_iter', None)
                     stop_by_eps = self.solve_params.get('stop_by_eps', None)
                     decimal_places = self.solve_params.get('decimal_places', None)
+                
+                # Store a local copy of calculation_active
+                is_active = True
+                
+                # Solve the problem (outside the lock to avoid deadlocks)
+                result, table_data = self.solver.solve(method, f_str, params, eps, eps_operator, max_iter, stop_by_eps, decimal_places)
+                
+                # Check if calculation is still active before updating UI
+                with self.calculation_lock:
+                    is_active = self.calculation_active and not self.is_shutting_down
+                
+                # Post the results back to the main thread if calculation is still active
+                if is_active and not self.is_shutting_down and hasattr(self, 'root') and self.root.winfo_exists():
+                    self.safe_after(0, lambda: self._process_solve_result(result, table_data, method, f_str, decimal_places))
                     
-                    # Solve the problem
-                    result, table_data = self.solver.solve(method, f_str, params, eps, eps_operator, max_iter, stop_by_eps, decimal_places)
-                    
-                    # Schedule UI update on the main thread
-                    self.root.after(0, lambda: self._process_solve_result(result, table_data, method, f_str, decimal_places))
             except Exception as e:
                 self.logger.error(f"Error in calculation thread: {str(e)}")
-                # Show error in UI from main thread
-                self.root.after(0, lambda: self._show_calculation_error(str(e)))
+                
+                # Check if app is still running before showing error
+                if not self.is_shutting_down and hasattr(self, 'root') and self.root.winfo_exists():
+                    with self.calculation_lock:
+                        is_active = self.calculation_active
+                    
+                    if is_active:
+                        self.safe_after(0, lambda: self._show_calculation_error(str(e)))
+                    
+            finally:
+                # Release the lock and update calculation status
+                with self.calculation_lock:
+                    self.calculation_active = False
         
         # Run calculation in thread if needed, otherwise directly
         if use_threading:
@@ -591,25 +633,33 @@ class NumericalApp:
         """Cancel the current calculation."""
         # We can't actually interrupt a thread in Python safely,
         # but we can set a flag to indicate the calculation should stop
-        # and clean up the UI
         self.logger.info("User canceled calculation")
         
-        # Clean up UI
-        if hasattr(self, 'plot_frame'):
+        # Mark calculation as inactive so thread knows to stop
+        with self.calculation_lock:
+            self.calculation_active = False
+        
+        # Clean up UI safely
+        if not self.is_shutting_down and hasattr(self, 'root') and self.root.winfo_exists() and hasattr(self, 'plot_frame'):
+            # Clear the plot frame
             for widget in self.plot_frame.winfo_children():
                 try:
                     widget.destroy()
-                except Exception:
+                except Exception as e:
+                    self.logger.debug(f"Error destroying widget: {e}")
                     pass
             
             # Show canceled message
-            canceled_label = ctk.CTkLabel(
-                self.plot_frame,
-                text="Calculation canceled",
-                font=ctk.CTkFont(size=16, weight="bold"),
-                text_color=self.theme.get("text", "#1E293B")
-            )
-            canceled_label.pack(pady=20)
+            try:
+                canceled_label = ctk.CTkLabel(
+                    self.plot_frame,
+                    text="Calculation canceled",
+                    font=ctk.CTkFont(size=16, weight="bold"),
+                    text_color=self.theme.get("text", "#1E293B")
+                )
+                canceled_label.pack(pady=20)
+            except Exception as e:
+                self.logger.debug(f"Error showing canceled message: {e}")
     
     def _show_calculation_error(self, error_message):
         """Show calculation error in the UI."""
@@ -1336,7 +1386,7 @@ class NumericalApp:
                         # Remove the success message after 3 seconds and track the after ID
                         if "clear_history_success" in self.after_ids:
                             self.root.after_cancel(self.after_ids["clear_history_success"])
-                        self.after_ids["clear_history_success"] = self.root.after(3000, success_label.destroy)
+                        self.safe_after(3000, success_label.destroy, "clear_history_success")
                     else:
                         raise Exception("Failed to clear history")
                 except Exception as e:
@@ -1352,7 +1402,7 @@ class NumericalApp:
                     # Remove the error message after 5 seconds and track the after ID
                     if "clear_history_error" in self.after_ids:
                         self.root.after_cancel(self.after_ids["clear_history_error"])
-                    self.after_ids["clear_history_error"] = self.root.after(5000, error_label.destroy)
+                    self.safe_after(5000, error_label.destroy, "clear_history_error")
             
             clear_button = ctk.CTkButton(
                 button_container,
@@ -1400,134 +1450,409 @@ class NumericalApp:
             settings_frame = ctk.CTkFrame(self.content_frame, fg_color=self.theme.get("bg", "#F0F4F8"))
             settings_frame.pack(fill="both", expand=True, padx=20, pady=20)
             
-            # Add a title
+            # Add a title with icon
+            title_frame = ctk.CTkFrame(settings_frame, fg_color=self.theme.get("bg", "#F0F4F8"))
+            title_frame.pack(fill="x", pady=(20, 10))
+            
             title_label = ctk.CTkLabel(
-                settings_frame, 
-                text="Settings", 
-                font=ctk.CTkFont(size=24, weight="bold"),
+                title_frame, 
+                text="Settings & Preferences",
+                font=ctk.CTkFont(size=28, weight="bold"),
                 text_color=self.theme.get("text", "#1E293B")
             )
-            title_label.pack(pady=(20, 30))
+            title_label.pack(side="left", padx=20)
+            
+            subtitle = ctk.CTkLabel(
+                settings_frame, 
+                text="Customize the application to suit your workflow",
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#64748B")
+            )
+            subtitle.pack(pady=(0, 20), anchor="w", padx=20)
             
             # Create a scrollable frame for settings
             scrollable_frame = ctk.CTkScrollableFrame(
                 settings_frame, 
                 fg_color=self.theme.get("bg", "#F0F4F8"),
-                width=600,
-                height=400
+                width=700,
+                height=450
             )
-            scrollable_frame.pack(fill="both", expand=True, padx=20, pady=10)
+            scrollable_frame.pack(fill="both", expand=True, padx=10, pady=10)
+            
+            # --- Calculation Settings Card ---
+            calc_card = ctk.CTkFrame(scrollable_frame, fg_color=self.theme.get("fg", "#DDE4E6"), corner_radius=10)
+            calc_card.pack(fill="x", pady=10, padx=5, ipady=10)
+            
+            calc_header = ctk.CTkLabel(
+                calc_card, 
+                text="Calculation Settings",
+                font=ctk.CTkFont(size=18, weight="bold"),
+                text_color=self.theme.get("accent", "#4C51BF")
+            )
+            calc_header.pack(anchor="w", padx=15, pady=(10, 15))
             
             # Default Decimal Places
-            decimal_frame = ctk.CTkFrame(scrollable_frame, fg_color=self.theme.get("bg", "#F0F4F8"))
-            decimal_frame.pack(fill="x", pady=10)
+            decimal_frame = ctk.CTkFrame(calc_card, fg_color="transparent")
+            decimal_frame.pack(fill="x", pady=5, padx=15)
             
             decimal_label = ctk.CTkLabel(
                 decimal_frame, 
                 text="Default Decimal Places:", 
-                font=ctk.CTkFont(size=16),
-                text_color=self.theme.get("text", "#1E293B")
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#1E293B"),
+                width=200,
+                anchor="w"
             )
-            decimal_label.pack(side="left", padx=10)
+            decimal_label.pack(side="left")
             
             decimal_var = ctk.StringVar(value=str(self.solver.decimal_places))
             decimal_entry = ctk.CTkEntry(
                 decimal_frame, 
-                width=100, 
+                width=120, 
                 textvariable=decimal_var,
                 placeholder_text="e.g., 6"
             )
             decimal_entry.pack(side="left", padx=10)
             
+            decimal_info = ctk.CTkLabel(
+                decimal_frame,
+                text="Affects display precision",
+                font=ctk.CTkFont(size=12),
+                text_color=self.theme.get("text", "#64748B")
+            )
+            decimal_info.pack(side="left", padx=10)
+            
             # Maximum Iterations
-            iter_frame = ctk.CTkFrame(scrollable_frame, fg_color=self.theme.get("bg", "#F0F4F8"))
-            iter_frame.pack(fill="x", pady=10)
+            iter_frame = ctk.CTkFrame(calc_card, fg_color="transparent")
+            iter_frame.pack(fill="x", pady=5, padx=15)
             
             iter_label = ctk.CTkLabel(
                 iter_frame, 
                 text="Maximum Iterations:", 
-                font=ctk.CTkFont(size=16),
-                text_color=self.theme.get("text", "#1E293B")
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#1E293B"),
+                width=200,
+                anchor="w"
             )
-            iter_label.pack(side="left", padx=10)
+            iter_label.pack(side="left")
             
             iter_var = ctk.StringVar(value=str(self.solver.max_iter))
             iter_entry = ctk.CTkEntry(
                 iter_frame, 
-                width=100, 
+                width=120, 
                 textvariable=iter_var,
                 placeholder_text="e.g., 50"
             )
             iter_entry.pack(side="left", padx=10)
             
+            iter_info = ctk.CTkLabel(
+                iter_frame,
+                text="Higher values may increase accuracy",
+                font=ctk.CTkFont(size=12),
+                text_color=self.theme.get("text", "#64748B")
+            )
+            iter_info.pack(side="left", padx=10)
+            
             # Error Tolerance
-            eps_frame = ctk.CTkFrame(scrollable_frame, fg_color=self.theme.get("bg", "#F0F4F8"))
-            eps_frame.pack(fill="x", pady=10)
+            eps_frame = ctk.CTkFrame(calc_card, fg_color="transparent")
+            eps_frame.pack(fill="x", pady=5, padx=15)
             
             eps_label = ctk.CTkLabel(
                 eps_frame, 
                 text="Error Tolerance:", 
-                font=ctk.CTkFont(size=16),
-                text_color=self.theme.get("text", "#1E293B")
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#1E293B"),
+                width=200,
+                anchor="w"
             )
-            eps_label.pack(side="left", padx=10)
+            eps_label.pack(side="left")
             
             eps_var = ctk.StringVar(value=str(self.solver.eps))
             eps_entry = ctk.CTkEntry(
                 eps_frame, 
-                width=100, 
+                width=120, 
                 textvariable=eps_var,
                 placeholder_text="e.g., 0.0001"
             )
             eps_entry.pack(side="left", padx=10)
             
+            eps_info = ctk.CTkLabel(
+                eps_frame,
+                text="Lower values increase precision",
+                font=ctk.CTkFont(size=12),
+                text_color=self.theme.get("text", "#64748B")
+            )
+            eps_info.pack(side="left", padx=10)
+            
             # Maximum Epsilon Value
-            max_eps_frame = ctk.CTkFrame(scrollable_frame, fg_color=self.theme.get("bg", "#F0F4F8"))
-            max_eps_frame.pack(fill="x", pady=10)
+            max_eps_frame = ctk.CTkFrame(calc_card, fg_color="transparent")
+            max_eps_frame.pack(fill="x", pady=5, padx=15)
             
             max_eps_label = ctk.CTkLabel(
                 max_eps_frame, 
                 text="Maximum Epsilon Value:", 
-                font=ctk.CTkFont(size=16),
-                text_color=self.theme.get("text", "#1E293B")
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#1E293B"),
+                width=200,
+                anchor="w"
             )
-            max_eps_label.pack(side="left", padx=10)
+            max_eps_label.pack(side="left")
             
             max_eps_var = ctk.StringVar(value=str(getattr(self.solver, "max_eps", 1.0)))
             max_eps_entry = ctk.CTkEntry(
                 max_eps_frame, 
-                width=100, 
+                width=120, 
                 textvariable=max_eps_var,
                 placeholder_text="e.g., 1.0"
             )
             max_eps_entry.pack(side="left", padx=10)
             
+            max_eps_info = ctk.CTkLabel(
+                max_eps_frame,
+                text="Upper bound for convergence check",
+                font=ctk.CTkFont(size=12),
+                text_color=self.theme.get("text", "#64748B")
+            )
+            max_eps_info.pack(side="left", padx=10)
+            
             # Stop Condition
-            stop_frame = ctk.CTkFrame(scrollable_frame, fg_color=self.theme.get("bg", "#F0F4F8"))
-            stop_frame.pack(fill="x", pady=10)
+            stop_frame = ctk.CTkFrame(calc_card, fg_color="transparent")
+            stop_frame.pack(fill="x", pady=5, padx=15)
             
             stop_label = ctk.CTkLabel(
                 stop_frame, 
                 text="Stop Condition:", 
-                font=ctk.CTkFont(size=16),
-                text_color=self.theme.get("text", "#1E293B")
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#1E293B"),
+                width=200,
+                anchor="w"
             )
-            stop_label.pack(side="left", padx=10)
+            stop_label.pack(side="left")
             
             stop_var = ctk.StringVar(value="Error Tolerance" if self.solver.stop_by_eps else "Maximum Iterations")
             stop_option = ctk.CTkOptionMenu(
                 stop_frame, 
-                values=["Error Tolerance", "Maximum Iterations"], 
+                values=["Error Tolerance", "Maximum Iterations", "Both"], 
                 variable=stop_var, 
-                fg_color=self.theme.get("button", "#3B82F6"), 
-                button_color=self.theme.get("button_hover", "#2563EB"),
-                button_hover_color=self.theme.get("accent", "#0EA5E9")
+                width=120,
+                dropdown_fg_color=self.theme.get("bg", "#F0F4F8"),
+                fg_color=self.theme.get("button", "#4C51BF"), 
+                button_color=self.theme.get("button_hover", "#3C41AF"),
+                button_hover_color=self.theme.get("accent", "#4C51BF")
             )
             stop_option.pack(side="left", padx=10)
             
+            stop_info = ctk.CTkLabel(
+                stop_frame,
+                text="Determines when to stop iterations",
+                font=ctk.CTkFont(size=12),
+                text_color=self.theme.get("text", "#64748B")
+            )
+            stop_info.pack(side="left", padx=10)
+
+            # --- User Interface Settings Card ---
+            ui_card = ctk.CTkFrame(scrollable_frame, fg_color=self.theme.get("fg", "#DDE4E6"), corner_radius=10)
+            ui_card.pack(fill="x", pady=10, padx=5, ipady=10)
+            
+            ui_header = ctk.CTkLabel(
+                ui_card, 
+                text="User Interface Settings",
+                font=ctk.CTkFont(size=18, weight="bold"),
+                text_color=self.theme.get("accent", "#4C51BF")
+            )
+            ui_header.pack(anchor="w", padx=15, pady=(10, 15))
+            
+            # Theme Selection
+            theme_frame = ctk.CTkFrame(ui_card, fg_color="transparent")
+            theme_frame.pack(fill="x", pady=5, padx=15)
+            
+            theme_label = ctk.CTkLabel(
+                theme_frame, 
+                text="Application Theme:", 
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#1E293B"),
+                width=200,
+                anchor="w"
+            )
+            theme_label.pack(side="left")
+            
+            # Currently only light theme is available
+            theme_var = ctk.StringVar(value="Light")
+            theme_option = ctk.CTkOptionMenu(
+                theme_frame, 
+                values=["Light"], 
+                variable=theme_var,
+                width=120,
+                dropdown_fg_color=self.theme.get("bg", "#F0F4F8"),
+                fg_color=self.theme.get("button", "#4C51BF"), 
+                button_color=self.theme.get("button_hover", "#3C41AF"),
+                button_hover_color=self.theme.get("accent", "#4C51BF")
+            )
+            theme_option.pack(side="left", padx=10)
+            
+            theme_info = ctk.CTkLabel(
+                theme_frame,
+                text="More themes coming soon",
+                font=ctk.CTkFont(size=12),
+                text_color=self.theme.get("text", "#64748B")
+            )
+            theme_info.pack(side="left", padx=10)
+            
+            # Font Size
+            font_frame = ctk.CTkFrame(ui_card, fg_color="transparent")
+            font_frame.pack(fill="x", pady=5, padx=15)
+            
+            font_label = ctk.CTkLabel(
+                font_frame, 
+                text="Font Size:", 
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#1E293B"),
+                width=200,
+                anchor="w"
+            )
+            font_label.pack(side="left")
+            
+            font_size = getattr(self, "font_size", "Medium")
+            font_var = ctk.StringVar(value=font_size)
+            font_option = ctk.CTkOptionMenu(
+                font_frame, 
+                values=["Small", "Medium", "Large"], 
+                variable=font_var,
+                width=120,
+                dropdown_fg_color=self.theme.get("bg", "#F0F4F8"),
+                fg_color=self.theme.get("button", "#4C51BF"), 
+                button_color=self.theme.get("button_hover", "#3C41AF"),
+                button_hover_color=self.theme.get("accent", "#4C51BF")
+            )
+            font_option.pack(side="left", padx=10)
+            
+            font_info = ctk.CTkLabel(
+                font_frame,
+                text="Affects UI text size",
+                font=ctk.CTkFont(size=12),
+                text_color=self.theme.get("text", "#64748B")
+            )
+            font_info.pack(side="left", padx=10)
+            
+            # Auto-save Settings
+            autosave_frame = ctk.CTkFrame(ui_card, fg_color="transparent")
+            autosave_frame.pack(fill="x", pady=5, padx=15)
+            
+            autosave_label = ctk.CTkLabel(
+                autosave_frame, 
+                text="Auto-save Results:", 
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#1E293B"),
+                width=200,
+                anchor="w"
+            )
+            autosave_label.pack(side="left")
+            
+            autosave = getattr(self, "autosave", False)
+            autosave_var = ctk.BooleanVar(value=autosave)
+            autosave_switch = ctk.CTkSwitch(
+                autosave_frame, 
+                text="", 
+                variable=autosave_var,
+                width=60,
+                fg_color=self.theme.get("bg", "#F0F4F8"),
+                progress_color=self.theme.get("accent", "#4C51BF"),
+                button_color=self.theme.get("fg", "#DDE4E6"),
+                button_hover_color=self.theme.get("fg", "#DDE4E6"),
+            )
+            autosave_switch.pack(side="left", padx=10)
+            
+            autosave_info = ctk.CTkLabel(
+                autosave_frame,
+                text="Automatically save calculation results",
+                font=ctk.CTkFont(size=12),
+                text_color=self.theme.get("text", "#64748B")
+            )
+            autosave_info.pack(side="left", padx=10)
+            
+            # --- Advanced Settings Card ---
+            adv_card = ctk.CTkFrame(scrollable_frame, fg_color=self.theme.get("fg", "#DDE4E6"), corner_radius=10)
+            adv_card.pack(fill="x", pady=10, padx=5, ipady=10)
+            
+            adv_header = ctk.CTkLabel(
+                adv_card, 
+                text="Advanced Settings",
+                font=ctk.CTkFont(size=18, weight="bold"),
+                text_color=self.theme.get("accent", "#4C51BF")
+            )
+            adv_header.pack(anchor="w", padx=15, pady=(10, 15))
+            
+            # Export Format
+            export_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
+            export_frame.pack(fill="x", pady=5, padx=15)
+            
+            export_label = ctk.CTkLabel(
+                export_frame, 
+                text="Default Export Format:", 
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#1E293B"),
+                width=200,
+                anchor="w"
+            )
+            export_label.pack(side="left")
+            
+            export_format = getattr(self, "export_format", "CSV")
+            export_var = ctk.StringVar(value=export_format)
+            export_option = ctk.CTkOptionMenu(
+                export_frame, 
+                values=["CSV", "Excel", "PDF", "JSON"], 
+                variable=export_var,
+                width=120,
+                dropdown_fg_color=self.theme.get("bg", "#F0F4F8"),
+                fg_color=self.theme.get("button", "#4C51BF"), 
+                button_color=self.theme.get("button_hover", "#3C41AF"),
+                button_hover_color=self.theme.get("accent", "#4C51BF")
+            )
+            export_option.pack(side="left", padx=10)
+            
+            export_info = ctk.CTkLabel(
+                export_frame,
+                text="For exporting calculation results",
+                font=ctk.CTkFont(size=12),
+                text_color=self.theme.get("text", "#64748B")
+            )
+            export_info.pack(side="left", padx=10)
+            
+            # Calculation Timeout
+            timeout_frame = ctk.CTkFrame(adv_card, fg_color="transparent")
+            timeout_frame.pack(fill="x", pady=5, padx=15)
+            
+            timeout_label = ctk.CTkLabel(
+                timeout_frame, 
+                text="Calculation Timeout (sec):", 
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#1E293B"),
+                width=200,
+                anchor="w"
+            )
+            timeout_label.pack(side="left")
+            
+            timeout = getattr(self, "timeout", 30)
+            timeout_var = ctk.StringVar(value=str(timeout))
+            timeout_entry = ctk.CTkEntry(
+                timeout_frame, 
+                width=120, 
+                textvariable=timeout_var,
+                placeholder_text="e.g., 30"
+            )
+            timeout_entry.pack(side="left", padx=10)
+            
+            timeout_info = ctk.CTkLabel(
+                timeout_frame,
+                text="Maximum time before cancellation",
+                font=ctk.CTkFont(size=12),
+                text_color=self.theme.get("text", "#64748B")
+            )
+            timeout_info.pack(side="left", padx=10)
+            
             # Create button container
             button_container = ctk.CTkFrame(settings_frame, fg_color=self.theme.get("bg", "#F0F4F8"))
-            button_container.pack(fill="x", pady=10)
+            button_container.pack(fill="x", pady=20)
             
             # Save Button
             def save_settings():
@@ -1569,111 +1894,184 @@ class NumericalApp:
                         raise ValueError(f"Invalid maximum epsilon: {str(e)}")
                     
                     # Save stop condition
-                    self.solver.stop_by_eps = stop_var.get() == "Error Tolerance"
+                    self.solver.stop_by_eps = stop_var.get() in ["Error Tolerance", "Both"]
                     
-                    # Show success message
-                    success_label = ctk.CTkLabel(
+                    # Save UI settings
+                    self.font_size = font_var.get()
+                    self.autosave = autosave_var.get()
+                    self.export_format = export_var.get()
+                    
+                    # Save timeout setting
+                    try:
+                        timeout = int(timeout_var.get())
+                        if timeout <= 0:
+                            raise ValueError("Timeout must be positive")
+                        self.timeout = timeout
+                    except ValueError as e:
+                        raise ValueError(f"Invalid timeout: {str(e)}")
+                    
+                    # Show success message with animation
+                    success_frame = ctk.CTkFrame(
                         settings_frame, 
-                        text="Settings saved successfully!", 
-                        text_color="green", 
-                        font=ctk.CTkFont(size=14)
+                        fg_color=self.theme.get("accent", "#4C51BF"),
+                        corner_radius=10
                     )
-                    success_label.pack(pady=10)
+                    success_frame.place(relx=0.5, rely=0.9, anchor="center", relwidth=0.5, height=40)
+                    
+                    success_label = ctk.CTkLabel(
+                        success_frame, 
+                        text="✓ Settings saved successfully!", 
+                        text_color="white", 
+                        font=ctk.CTkFont(size=14, weight="bold")
+                    )
+                    success_label.pack(pady=10, padx=10, fill="both", expand=True)
                     
                     # Remove the success message after 3 seconds and track the after ID
                     if "save_settings_success" in self.after_ids:
                         self.root.after_cancel(self.after_ids["save_settings_success"])
-                    self.after_ids["save_settings_success"] = self.root.after(3000, success_label.destroy)
+                    
+                    def hide_success():
+                        success_frame.place_forget()
+                        
+                    self.safe_after(3000, hide_success, "save_settings_success")
                     
                 except Exception as e:
                     self.logger.error(f"Error saving settings: {str(e)}")
-                    error_label = ctk.CTkLabel(
+                    
+                    # Show error message with animation
+                    error_frame = ctk.CTkFrame(
                         settings_frame, 
-                        text=f"Error saving settings: {str(e)}", 
-                        text_color="red", 
-                        font=ctk.CTkFont(size=14)
+                        fg_color="#E53E3E",  # Error red color
+                        corner_radius=10
                     )
-                    error_label.pack(pady=10)
+                    error_frame.place(relx=0.5, rely=0.9, anchor="center", relwidth=0.7, height=40)
+                    
+                    error_label = ctk.CTkLabel(
+                        error_frame, 
+                        text=f"✗ Error: {str(e)}", 
+                        text_color="white", 
+                        font=ctk.CTkFont(size=14, weight="bold")
+                    )
+                    error_label.pack(pady=10, padx=10, fill="both", expand=True)
                     
                     # Remove the error message after 5 seconds and track the after ID
                     if "save_settings_error" in self.after_ids:
                         self.root.after_cancel(self.after_ids["save_settings_error"])
-                    self.after_ids["save_settings_error"] = self.root.after(5000, error_label.destroy)
+                    
+                    def hide_error():
+                        error_frame.place_forget()
+                        
+                    self.safe_after(5000, hide_error, "save_settings_error")
             
             save_button = ctk.CTkButton(
                 button_container, 
-                text="Save Settings", 
+                text="Save Changes",
                 command=save_settings,
-                fg_color=self.theme.get("primary", "#3B82F6"), 
-                hover_color=self.theme.get("primary_hover", "#2563EB"),
+                fg_color=self.theme.get("primary", "#4C51BF"), 
+                hover_color=self.theme.get("primary_hover", "#3C41AF"),
                 text_color="white",
-                font=ctk.CTkFont(size=14, weight="bold")
+                font=ctk.CTkFont(size=14, weight="bold"),
+                height=38,
+                corner_radius=8,
+                width=170
             )
             save_button.pack(side="left", padx=10, expand=True)
             
             # Reset Button
             def reset_settings():
                 try:
+                    # Reset calculation settings
                     self.solver.decimal_places = 6
                     self.solver.max_iter = 50
                     self.solver.eps = 0.0001
+                    self.solver.max_eps = 1.0
                     self.solver.stop_by_eps = True
                     
+                    # Reset UI variables
                     decimal_var.set("6")
                     iter_var.set("50")
                     eps_var.set("0.0001")
+                    max_eps_var.set("1.0")
                     stop_var.set("Error Tolerance")
+                    font_var.set("Medium")
+                    autosave_var.set(False)
+                    export_var.set("CSV")
+                    timeout_var.set("30")
+                    
+                    # Reset UI settings
+                    self.font_size = "Medium"
+                    self.autosave = False
+                    self.export_format = "CSV"
+                    self.timeout = 30
+                    
+                    # Show success message with animation
+                    reset_frame = ctk.CTkFrame(
+                        settings_frame, 
+                        fg_color=self.theme.get("accent", "#4C51BF"),
+                        corner_radius=10
+                    )
+                    reset_frame.place(relx=0.5, rely=0.9, anchor="center", relwidth=0.5, height=40)
                     
                     reset_label = ctk.CTkLabel(
-                        settings_frame, 
-                        text="Settings reset to defaults!", 
-                        text_color="green", 
-                        font=ctk.CTkFont(size=14)
+                        reset_frame, 
+                        text="✓ Settings reset to defaults!", 
+                        text_color="white", 
+                        font=ctk.CTkFont(size=14, weight="bold")
                     )
-                    reset_label.pack(pady=10)
+                    reset_label.pack(pady=10, padx=10, fill="both", expand=True)
                     
                     # Remove the reset message after 3 seconds and track the after ID
                     if "reset_settings_success" in self.after_ids:
                         self.root.after_cancel(self.after_ids["reset_settings_success"])
-                    self.after_ids["reset_settings_success"] = self.root.after(3000, reset_label.destroy)
+                    
+                    def hide_reset():
+                        reset_frame.place_forget()
+                        
+                    self.safe_after(3000, hide_reset, "reset_settings_success")
                     
                 except Exception as e:
                     self.logger.error(f"Error resetting settings: {str(e)}")
-                    error_label = ctk.CTkLabel(
+                    
+                    # Show error message with animation
+                    error_frame = ctk.CTkFrame(
                         settings_frame, 
-                        text=f"Error resetting settings: {str(e)}", 
-                        text_color="red", 
-                        font=ctk.CTkFont(size=14)
+                        fg_color="#E53E3E",  # Error red color
+                        corner_radius=10
                     )
-                    error_label.pack(pady=10)
+                    error_frame.place(relx=0.5, rely=0.9, anchor="center", relwidth=0.7, height=40)
+                    
+                    error_label = ctk.CTkLabel(
+                        error_frame, 
+                        text=f"✗ Error: {str(e)}", 
+                        text_color="white", 
+                        font=ctk.CTkFont(size=14, weight="bold")
+                    )
+                    error_label.pack(pady=10, padx=10, fill="both", expand=True)
                     
                     # Remove the error message after 5 seconds and track the after ID
                     if "reset_settings_error" in self.after_ids:
                         self.root.after_cancel(self.after_ids["reset_settings_error"])
-                    self.after_ids["reset_settings_error"] = self.root.after(5000, error_label.destroy)
+                    
+                    def hide_error():
+                        error_frame.place_forget()
+                        
+                    self.safe_after(5000, hide_error, "reset_settings_error")
             
             reset_button = ctk.CTkButton(
                 button_container, 
-                text="Reset to Defaults", 
+                text="Reset to Defaults",
                 command=reset_settings,
-                fg_color=self.theme.get("secondary", "#64748B"), 
-                hover_color=self.theme.get("secondary_hover", "#475569"),
-                text_color="white",
-                font=ctk.CTkFont(size=14, weight="bold")
+                fg_color="transparent", 
+                hover_color=self.theme.get("fg", "#DDE4E6"),
+                text_color=self.theme.get("text", "#1E293B"),
+                font=ctk.CTkFont(size=14),
+                border_width=1,
+                border_color=self.theme.get("text", "#1E293B"),
+                height=38,
+                corner_radius=8,
+                width=170
             )
             reset_button.pack(side="right", padx=10, expand=True)
-            
-            # Add a back button
-            back_button = ctk.CTkButton(
-                button_container,
-                text="Back to Home",
-                command=self.show_home,
-                fg_color=self.theme.get("primary", "#3B82F6"),
-                hover_color=self.theme.get("primary_hover", "#2563EB"),
-                text_color="white",
-                font=ctk.CTkFont(size=14, weight="bold")
-            )
-            back_button.pack(side="right", padx=10, expand=True)
             
         except Exception as e:
             self.logger.error(f"Error showing settings: {str(e)}")
@@ -1682,9 +2080,9 @@ class NumericalApp:
             error_frame.pack(fill="both", expand=True, padx=10, pady=10)
             
             error_label = ctk.CTkLabel(
-                error_frame, 
-                text=f"Error loading settings: {str(e)}", 
-                text_color="red", 
+                error_frame,
+                text=f"Error loading settings: {str(e)}",
+                text_color="red",
                 font=ctk.CTkFont(size=14)
             )
             error_label.pack(pady=10)
@@ -1694,8 +2092,8 @@ class NumericalApp:
                 error_frame,
                 text="Back to Home",
                 command=self.show_home,
-                fg_color=self.theme.get("primary", "#3B82F6"),
-                hover_color=self.theme.get("primary_hover", "#2563EB"),
+                fg_color=self.theme.get("primary", "#4C51BF"),
+                hover_color=self.theme.get("primary_hover", "#3C41AF"),
                 text_color="white",
                 font=ctk.CTkFont(size=14, weight="bold")
             )
@@ -1710,76 +2108,228 @@ class NumericalApp:
             about_frame = ctk.CTkFrame(self.content_frame, fg_color=self.theme.get("bg", "#F0F4F8"))
             about_frame.pack(fill="both", expand=True, padx=10, pady=10)
             
-            # Create a scrollable frame for content
-            scrollable_frame = ctk.CTkScrollableFrame(about_frame, fg_color=self.theme.get("bg", "#F0F4F8"))
-            scrollable_frame.pack(fill="both", expand=True, padx=5, pady=5)
+            # Create top section with logo and app info
+            top_section = ctk.CTkFrame(about_frame, fg_color=self.theme.get("bg", "#F0F4F8"))
+            top_section.pack(fill="x", padx=20, pady=(20, 10))
             
-            # Application Title
-            title_label = ctk.CTkLabel(
-                scrollable_frame,
-                text="Numerical Analysis Application",
+            # Application Title with decorative element
+            title_frame = ctk.CTkFrame(top_section, fg_color=self.theme.get("accent", "#4C51BF"), corner_radius=10)
+            title_frame.pack(side="left", padx=(0, 20))
+            
+            # Add a mathematical symbol as decorative element
+            math_symbol = ctk.CTkLabel(
+                title_frame,
+                text="∫ ∑ ∂",
                 font=ctk.CTkFont(size=24, weight="bold"),
-                text_color=self.theme.get("text", "#1E293B")
+                text_color="white"
             )
-            title_label.pack(pady=(0, 10))
+            math_symbol.pack(pady=20, padx=20)
+            
+            # App info container
+            app_info = ctk.CTkFrame(top_section, fg_color=self.theme.get("bg", "#F0F4F8"))
+            app_info.pack(side="left", fill="both", expand=True)
+            
+            title_label = ctk.CTkLabel(
+                app_info,
+                text="Numerical Analysis Application",
+                font=ctk.CTkFont(size=28, weight="bold"),
+                text_color=self.theme.get("text", "#1E293B"),
+                anchor="w"
+            )
+            title_label.pack(fill="x", pady=(0, 5))
             
             # Version - safely handle if version is not defined
             version = getattr(self, "version", "1.0.0")
             version_label = ctk.CTkLabel(
-                scrollable_frame,
+                app_info,
                 text=f"Version: {version}",
-                font=ctk.CTkFont(size=16),
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#64748B"),
+                anchor="w"
+            )
+            version_label.pack(fill="x", pady=(0, 5))
+            
+            # Release date
+            release_date = ctk.CTkLabel(
+                app_info,
+                text=f"Release Date: May 2024",
+                font=ctk.CTkFont(size=14),
+                text_color=self.theme.get("text", "#64748B"),
+                anchor="w"
+            )
+            release_date.pack(fill="x", pady=(0, 10))
+            
+            # Divider
+            divider = ctk.CTkFrame(about_frame, height=2, fg_color=self.theme.get("fg", "#DDE4E6"))
+            divider.pack(fill="x", padx=20, pady=10)
+            
+            # Create a scrollable frame for content
+            scrollable_frame = ctk.CTkScrollableFrame(
+                about_frame, 
+                fg_color=self.theme.get("bg", "#F0F4F8"),
+                scrollbar_fg_color=self.theme.get("bg", "#F0F4F8"),
+                scrollbar_button_color=self.theme.get("accent", "#4C51BF")
+            )
+            scrollable_frame.pack(fill="both", expand=True, padx=20, pady=5)
+            
+            # Features Section
+            features_frame = ctk.CTkFrame(scrollable_frame, fg_color=self.theme.get("fg", "#DDE4E6"), corner_radius=10)
+            features_frame.pack(fill="x", pady=10, ipady=10)
+            
+            features_title = ctk.CTkLabel(
+                features_frame,
+                text="Features",
+                font=ctk.CTkFont(size=18, weight="bold"),
+                text_color=self.theme.get("accent", "#4C51BF")
+            )
+            features_title.pack(anchor="w", padx=15, pady=(10, 15))
+            
+            # Feature list
+            features = [
+                "📊 Multiple numerical methods for root finding and equation solving",
+                "📈 Interactive function plotting with error analysis",
+                "📋 Detailed step-by-step solution visualization",
+                "📁 Export results to various formats (CSV, Excel, PDF)",
+                "🔧 Customizable calculation settings and precision control",
+                "📱 Responsive interface with modern design",
+                "💾 Solution history for reviewing past calculations"
+            ]
+            
+            for feature in features:
+                feature_label = ctk.CTkLabel(
+                    features_frame,
+                    text=feature,
+                    font=ctk.CTkFont(size=14),
+                    text_color=self.theme.get("text", "#1E293B"),
+                    anchor="w"
+                )
+                feature_label.pack(fill="x", padx=15, pady=3)
+            
+            # Implemented Methods Section
+            methods_frame = ctk.CTkFrame(scrollable_frame, fg_color=self.theme.get("fg", "#DDE4E6"), corner_radius=10)
+            methods_frame.pack(fill="x", pady=10, ipady=10)
+            
+            methods_title = ctk.CTkLabel(
+                methods_frame,
+                text="Implemented Methods",
+                font=ctk.CTkFont(size=18, weight="bold"),
+                text_color=self.theme.get("accent", "#4C51BF")
+            )
+            methods_title.pack(anchor="w", padx=15, pady=(10, 15))
+            
+            # Methods grid - using two columns
+            methods_container = ctk.CTkFrame(methods_frame, fg_color="transparent")
+            methods_container.pack(fill="x", padx=15, pady=5)
+            
+            # Column 1
+            methods_col1 = ctk.CTkFrame(methods_container, fg_color="transparent")
+            methods_col1.pack(side="left", fill="both", expand=True)
+            
+            methods1 = [
+                "• Bisection Method",
+                "• Newton-Raphson Method",
+                "• Secant Method",
+                "• Fixed-Point Iteration"
+            ]
+            
+            for method in methods1:
+                method_label = ctk.CTkLabel(
+                    methods_col1,
+                    text=method,
+                    font=ctk.CTkFont(size=14),
+                    text_color=self.theme.get("text", "#1E293B"),
+                    anchor="w"
+                )
+                method_label.pack(fill="x", pady=3)
+            
+            # Column 2
+            methods_col2 = ctk.CTkFrame(methods_container, fg_color="transparent")
+            methods_col2.pack(side="left", fill="both", expand=True)
+            
+            methods2 = [
+                "• Gauss Elimination",
+                "• Gauss-Jordan Method",
+                "• LU Decomposition",
+                "• Cramer's Rule"
+            ]
+            
+            for method in methods2:
+                method_label = ctk.CTkLabel(
+                    methods_col2,
+                    text=method,
+                    font=ctk.CTkFont(size=14),
+                    text_color=self.theme.get("text", "#1E293B"),
+                    anchor="w"
+                )
+                method_label.pack(fill="x", pady=3)
+            
+            # Technology Section
+            tech_frame = ctk.CTkFrame(scrollable_frame, fg_color=self.theme.get("fg", "#DDE4E6"), corner_radius=10)
+            tech_frame.pack(fill="x", pady=10, ipady=10)
+            
+            tech_title = ctk.CTkLabel(
+                tech_frame,
+                text="Technology Stack",
+                font=ctk.CTkFont(size=18, weight="bold"),
+                text_color=self.theme.get("accent", "#4C51BF")
+            )
+            tech_title.pack(anchor="w", padx=15, pady=(10, 15))
+            
+            tech_items = [
+                "• Python - Core programming language",
+                "• CustomTkinter - Modern UI framework",
+                "• NumPy - Numerical computations and array operations",
+                "• Matplotlib - Data visualization and plotting",
+                "• SymPy - Symbolic mathematics for equation parsing"
+            ]
+            
+            for item in tech_items:
+                tech_label = ctk.CTkLabel(
+                    tech_frame,
+                    text=item,
+                    font=ctk.CTkFont(size=14),
+                    text_color=self.theme.get("text", "#1E293B"),
+                    anchor="w"
+                )
+                tech_label.pack(fill="x", padx=15, pady=3)
+            
+            # Credits section 
+            credits_frame = ctk.CTkFrame(scrollable_frame, fg_color=self.theme.get("fg", "#DDE4E6"), corner_radius=10)
+            credits_frame.pack(fill="x", pady=10, ipady=10)
+            
+            credits_title = ctk.CTkLabel(
+                credits_frame,
+                text="Credits & Contributors",
+                font=ctk.CTkFont(size=18, weight="bold"),
+                text_color=self.theme.get("accent", "#4C51BF")
+            )
+            credits_title.pack(anchor="w", padx=15, pady=(10, 15))
+            
+            credits_info = ctk.CTkLabel(
+                credits_frame,
+                text="Developed by Hosam Dyab and Hazem Mohamed\nSpecial thanks to all numerical analysis and scientific computing communities",
+                font=ctk.CTkFont(size=14),
                 text_color=self.theme.get("text", "#1E293B")
             )
-            version_label.pack(pady=(0, 20))
-            
-            # Description
-            description_text = """
-            This application provides a comprehensive suite of numerical analysis tools for solving various mathematical problems.
-            
-            Features:
-            • Multiple numerical methods for root finding
-            • Interactive function plotting
-            • Detailed solution steps and iterations
-            • Export capabilities for results
-            • Customizable settings
-            
-            The application is designed to help students and professionals understand and implement numerical methods effectively.
-            """
-            
-            description_label = ctk.CTkLabel(
-                scrollable_frame,
-                text=description_text,
-                font=ctk.CTkFont(size=14),
-                text_color=self.theme.get("text", "#1E293B"),
-                justify="left"
-            )
-            description_label.pack(pady=(0, 20), padx=20)
-            
-            # Credits
-            credits_label = ctk.CTkLabel(
-                scrollable_frame,
-                text="Developed by Hosam Dyab + Hazem Mohamed using Python and CustomTkinter",
-                font=ctk.CTkFont(size=14, weight="bold"),
-                text_color=self.theme.get("accent", "#0EA5E9")
-            )
-            credits_label.pack(pady=(0, 10))
+            credits_info.pack(padx=15, pady=5)
             
             # Create button container
             button_container = ctk.CTkFrame(about_frame, fg_color=self.theme.get("bg", "#F0F4F8"))
-            button_container.pack(fill="x", pady=10)
+            button_container.pack(fill="x", pady=15)
             
             # Back Button
             back_button = ctk.CTkButton(
                 button_container,
                 text="Back to Home",
                 command=self.show_home,
-                fg_color=self.theme.get("primary", "#3B82F6"),
-                hover_color=self.theme.get("primary_hover", "#2563EB"),
+                fg_color=self.theme.get("primary", "#4C51BF"),
+                hover_color=self.theme.get("primary_hover", "#3C41AF"),
                 text_color="white",
-                font=ctk.CTkFont(size=14, weight="bold")
+                font=ctk.CTkFont(size=14, weight="bold"),
+                height=38,
+                corner_radius=8
             )
-            back_button.pack(padx=10, expand=True)
+            back_button.pack(padx=20, pady=10)
             
         except Exception as e:
             self.logger.error(f"Error showing about screen: {str(e)}")
@@ -1800,8 +2350,8 @@ class NumericalApp:
                 error_frame,
                 text="Back to Home",
                 command=self.show_home,
-                fg_color=self.theme.get("primary", "#3B82F6"),
-                hover_color=self.theme.get("primary_hover", "#2563EB"),
+                fg_color=self.theme.get("primary", "#4C51BF"),
+                hover_color=self.theme.get("primary_hover", "#3C41AF"),
                 text_color="white",
                 font=ctk.CTkFont(size=14, weight="bold")
             )
@@ -1810,6 +2360,10 @@ class NumericalApp:
     def check_dpi_scaling(self):
         """Check and adjust for high DPI displays."""
         try:
+            # If app is shutting down, don't schedule any new tasks
+            if getattr(self, 'is_shutting_down', False):
+                return
+                
             # Cancel any existing check_dpi_scaling callbacks
             if "check_dpi_scaling" in self.after_ids:
                 try:
@@ -1818,6 +2372,10 @@ class NumericalApp:
                 except Exception as e:
                     self.logger.debug(f"Error canceling check_dpi_scaling callback: {e}")
             
+            # Check if the window still exists before proceeding
+            if not hasattr(self, 'root') or not self.root.winfo_exists():
+                return
+                
             # Get screen width and height
             screen_width = self.root.winfo_screenwidth()
             screen_height = self.root.winfo_screenheight()
@@ -1837,8 +2395,11 @@ class NumericalApp:
     def cleanup(self):
         """Clean up resources and cancel scheduled events before closing."""
         try:
+            # Flag to indicate the application is shutting down
+            self.is_shutting_down = True
+            
             # Cancel all scheduled after events
-            for after_id_name, after_id in self.after_ids.items():
+            for after_id_name, after_id in list(self.after_ids.items()):
                 try:
                     self.root.after_cancel(after_id)
                     self.logger.debug(f"Cancelled after event: {after_id_name}")
@@ -1862,6 +2423,14 @@ class NumericalApp:
                         pass
             except Exception as e:
                 self.logger.debug(f"Error during after events cleanup: {e}")
+            
+            # Additional cleanup for threads and resources
+            if hasattr(self, 'calculation_thread') and getattr(self, 'calculation_thread', None) is not None:
+                if self.calculation_thread.is_alive():
+                    self._cancel_calculation()
+            
+            # Wait a brief moment to ensure all cancellations take effect
+            time.sleep(0.1)
                 
             self.logger.info("Application cleanup completed successfully")
         except Exception as e:
@@ -1870,8 +2439,25 @@ class NumericalApp:
     def run(self):
         """Run the application main loop."""
         try:
+            # Set shutdown flag to False during application startup
+            self.is_shutting_down = False
+            
             # Register cleanup function to handle window close
-            self.root.protocol("WM_DELETE_WINDOW", lambda: (self.cleanup(), self.root.destroy()))
+            # Use a safer shutdown sequence
+            def on_close():
+                try:
+                    self.cleanup()
+                    self.root.quit()  # Signal to exit mainloop
+                    self.root.destroy()  # Destroy the window
+                except Exception as e:
+                    self.logger.error(f"Error during window close: {e}")
+                    # Try one more time to destroy the window
+                    try:
+                        self.root.destroy()
+                    except:
+                        pass
+            
+            self.root.protocol("WM_DELETE_WINDOW", on_close)
             
             # Start the main event loop
             self.root.mainloop()
@@ -1880,3 +2466,39 @@ class NumericalApp:
             self.cleanup()
             self.logger.error(f"Error running application: {str(e)}")
             raise
+
+    def safe_after(self, delay, callback, after_id_name=None):
+        """Safely schedule an 'after' callback with shutdown check.
+        
+        Args:
+            delay: Delay in milliseconds
+            callback: Function to call after delay
+            after_id_name: Name to use as key in self.after_ids dictionary
+            
+        Returns:
+            The after ID if scheduled, or None if app is shutting down
+        """
+        # Check for shutdown flag
+        if getattr(self, 'is_shutting_down', False):
+            return None
+            
+        # Check if window still exists
+        if not hasattr(self, 'root') or not self.root.winfo_exists():
+            return None
+            
+        # Create a wrapper to check if app is still running before executing callback
+        def safe_callback_wrapper():
+            if not getattr(self, 'is_shutting_down', False) and hasattr(self, 'root') and self.root.winfo_exists():
+                try:
+                    callback()
+                except Exception as e:
+                    self.logger.error(f"Error in delayed callback: {str(e)}")
+        
+        # Schedule the callback
+        after_id = self.root.after(delay, safe_callback_wrapper)
+        
+        # Track the ID if name provided
+        if after_id_name:
+            self.after_ids[after_id_name] = after_id
+            
+        return after_id
