@@ -21,7 +21,8 @@ def sanitize_filename(filename: str) -> str:
 
 def format_table_data(table_data: List[Dict[str, Any]]) -> List[List[str]]:
     """
-    Format table data for PDF export with proper handling of different data types.
+    Format table data for PDF export with proper handling of different data types,
+    especially for matrix data.
     """
     if not table_data:
         return [["Message"], ["No data available"]]
@@ -38,13 +39,24 @@ def format_table_data(table_data: List[Dict[str, Any]]) -> List[List[str]]:
         formatted_row = []
         for header in headers:
             value = row.get(header, "")
+            
+            # Special handling for matrix data
+            if header == "Matrix" and isinstance(value, str):
+                # Preserve line breaks in matrix representations
+                # Replace multiple spaces with non-breaking spaces to maintain alignment
+                formatted_value = value.replace("  ", " \xa0")
+                formatted_row.append(formatted_value)
             # Convert various types to string representation
-            if isinstance(value, (int, float)):
+            elif isinstance(value, float):
+                # Format floats with consistent decimal places
+                formatted_row.append(f"{value:.6f}")
+            elif isinstance(value, int):
                 formatted_row.append(str(value))
             elif isinstance(value, dict):
                 formatted_row.append(str(value))
             else:
                 formatted_row.append(str(value))
+                
         formatted_data.append(formatted_row)
     
     return formatted_data
@@ -87,10 +99,32 @@ def export_to_pdf(filename: str, func: str, method: str, root: Any, table_data: 
         elements.append(Spacer(1, 0.25 * inch))
         elements.append(Paragraph("Solution", heading_style))
         
+        # Check if this is a matrix method by examining the function name or method name
+        is_matrix_method = func == "System of Linear Equations" or any(matrix_method in method for matrix_method in [
+            "Gauss", "Jordan", "LU", "Cramer", "Linear System"
+        ])
+        
         if isinstance(root, list):
             # For linear system methods
-            root_text = ", ".join([f"x{i+1} = {val}" for i, val in enumerate(root)])
-            elements.append(Paragraph(f"Solution: {root_text}", normal_style))
+            if is_matrix_method:
+                # Format matrix solution with proper spacing and alignment
+                elements.append(Paragraph("Solution Vector:", normal_style))
+                solution_items = []
+                for i, val in enumerate(root):
+                    # Format each variable with proper precision
+                    if isinstance(val, (int, float)):
+                        formatted_val = f"{val:.6f}" if isinstance(val, float) else str(val)
+                        solution_items.append(f"x{i+1} = {formatted_val}")
+                    else:
+                        solution_items.append(f"x{i+1} = {val}")
+                
+                # Add each solution variable on its own line for better readability
+                for item in solution_items:
+                    elements.append(Paragraph(f"• {item}", normal_style))
+            else:
+                # For other list-type solutions, use the original comma-separated format
+                root_text = ", ".join([f"x{i+1} = {val}" for i, val in enumerate(root)])
+                elements.append(Paragraph(f"Solution: {root_text}", normal_style))
         elif root is not None:
             # For root-finding methods
             elements.append(Paragraph(f"Root: {root}", normal_style))
@@ -107,7 +141,19 @@ def export_to_pdf(filename: str, func: str, method: str, root: Any, table_data: 
         
         # Create table
         if formatted_data:
-            table = Table(formatted_data)
+            # Adjust column widths for better display of matrix data
+            col_widths = None
+            if is_matrix_method and len(formatted_data) > 0 and len(formatted_data[0]) > 0:
+                # Make the Matrix column wider for matrix methods
+                col_widths = [1.0 * inch]  # Step column
+                for i in range(1, len(formatted_data[0])):
+                    if i == 1 and formatted_data[0][i] == "Matrix":  # Matrix column
+                        col_widths.append(3.5 * inch)  # Make Matrix column wider
+                    else:
+                        col_widths.append(2.0 * inch)  # Other columns
+            
+            # Create table with adjusted column widths if needed
+            table = Table(formatted_data, colWidths=col_widths)
             
             # Style the table
             style = TableStyle([
@@ -121,6 +167,11 @@ def export_to_pdf(filename: str, func: str, method: str, root: Any, table_data: 
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("ALIGN", (0, 0), (-1, -1), "CENTER")
             ])
+            
+            # Add special handling for matrix column
+            if is_matrix_method:
+                style.add("ALIGN", (1, 1), (1, -1), "LEFT")  # Left-align matrix column content
+                style.add("LEFTPADDING", (1, 1), (1, -1), 10)  # Add left padding to matrix column
             
             table.setStyle(style)
             elements.append(table)
